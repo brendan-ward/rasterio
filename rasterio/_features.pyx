@@ -2,6 +2,8 @@
 
 include "gdal.pxi"
 
+from libc.stdlib cimport malloc, free
+
 import logging
 
 import numpy as np
@@ -143,6 +145,184 @@ def _shapes(image, mask, connectivity, transform):
         shape_iter.fieldtype = fieldtp
         for s, v in shape_iter:
             yield s, v
+
+    finally:
+        if fs != NULL:
+            OGR_DS_Destroy(fs)
+
+
+
+def _shapes_wkb_array(image, mask, connectivity, transform):
+    """
+    Returns a tuple of 1D arrays of WKB-encoded polygons and pixel values.
+
+    Parameters
+    ----------
+    image : array or dataset object opened in 'r' mode or Band or tuple(dataset, bidx)
+        Data type must be one of rasterio.int16, rasterio.int32,
+        rasterio.uint8, rasterio.uint16, or rasterio.float32.
+    mask : numpy ndarray or rasterio Band object
+        Values of False or 0 will be excluded from feature generation
+        Must evaluate to bool (rasterio.bool_ or rasterio.uint8)
+    connectivity : int
+        Use 4 or 8 pixel connectivity for grouping pixels into features
+    transform : Affine
+        If not provided, feature coordinates will be generated based on pixel
+        coordinates
+
+    Returns
+    -------
+    tuple of (polygon array, values array)
+        Values are returned in the dtype of the input image.
+        Note: due to floating point precision issues, values returned from a
+        floating point image may not exactly match the original values.
+
+    """
+    cdef int retval
+    cdef int rows
+    cdef int cols
+    cdef GDALRasterBandH band = NULL
+    cdef GDALRasterBandH maskband = NULL
+    cdef GDALDriverH driver = NULL
+    cdef OGRDataSourceH fs = NULL
+    cdef OGRLayerH layer = NULL
+    cdef OGRFieldDefnH fielddefn = NULL
+    cdef char **options = NULL
+    cdef InMemoryRaster mem_ds = None
+    cdef InMemoryRaster mask_ds = None
+    cdef void * feature = NULL
+    cdef void * geometry = NULL
+    cdef char *wkb = NULL
+    cdef int feature_count = 0
+    cdef int i = 0
+    cdef int wkb_size = 0
+
+    cdef bint is_float = np.dtype(image.dtype).kind == 'f'
+    cdef int fieldtp = 2 if is_float else 0
+
+    valid_dtypes = ('int16', 'int32', 'uint8', 'uint16', 'float32')
+
+    if np.dtype(image.dtype).name not in valid_dtypes:
+        raise ValueError("image dtype must be one of: {0}".format(
+            ', '.join(valid_dtypes)))
+
+    if connectivity not in (4, 8):
+        raise ValueError("Connectivity Option must be 4 or 8")
+
+    try:
+
+        if dtypes.is_ndarray(image):
+            mem_ds = InMemoryRaster(image=image, transform=transform)
+            band = mem_ds.band(1)
+        elif isinstance(image, tuple):
+            rdr = image.ds
+            band = (<DatasetReaderBase?>rdr).band(image.bidx)
+        else:
+            raise ValueError("Invalid source image")
+
+        if mask is not None:
+            if mask.shape != image.shape:
+                raise ValueError("Mask must have same shape as image")
+
+            if np.dtype(mask.dtype).name not in ('bool', 'uint8'):
+                raise ValueError("Mask must be dtype rasterio.bool_ or "
+                                 "rasterio.uint8")
+
+            if dtypes.is_ndarray(mask):
+                # A boolean mask must be converted to uint8 for GDAL
+                mask_ds = InMemoryRaster(image=mask.astype('uint8'),
+                                         transform=transform)
+                maskband = mask_ds.band(1)
+            elif isinstance(mask, tuple):
+                mrdr = mask.ds
+                maskband = (<DatasetReaderBase?>mrdr).band(mask.bidx)
+
+        # Create an in-memory feature store.
+        driver = OGRGetDriverByName("Memory")
+        if driver == NULL:
+            raise ValueError("NULL driver")
+        fs = OGR_Dr_CreateDataSource(driver, "temp", NULL)
+        if fs == NULL:
+            raise ValueError("NULL feature dataset")
+
+        # And a layer.
+        layer = OGR_DS_CreateLayer(fs, "polygons", NULL, 3, NULL)
+        if layer == NULL:
+            raise ValueError("NULL layer")
+
+        fielddefn = OGR_Fld_Create("image_value", fieldtp)
+        if fielddefn == NULL:
+            raise ValueError("NULL field definition")
+        OGR_L_CreateField(layer, fielddefn, 1)
+        OGR_Fld_Destroy(fielddefn)
+
+        if connectivity == 8:
+            options = CSLSetNameValue(options, "8CONNECTED", "8")
+
+        if is_float:
+            GDALFPolygonize(band, maskband, layer, 0, options, NULL, NULL)
+        else:
+            GDALPolygonize(band, maskband, layer, 0, options, NULL, NULL)
+
+    finally:
+        if mem_ds is not None:
+            mem_ds.close()
+        if mask_ds is not None:
+            mask_ds.close()
+        if options:
+            CSLDestroy(options)
+
+    try:
+        # NOTE: this try is really the only part that is unique compared to the
+        # above _shapes() implementation.
+        # TODO: consolidate shared logic
+
+        feature_count = OGR_L_GetFeatureCount(layer, 1)
+        print(f"Num features {feature_count}")
+
+        # make sure layer is read from beginning
+        OGR_L_ResetReading(layer)
+
+        # Construct output array for polygons and associated memory view
+        polygon_data = np.empty(shape=(feature_count, ), dtype=np.object)
+        polygons = polygon_data[:]
+
+        # Construct output array for values and associated memory view.
+        values_data = np.empty(shape=(feature_count, ), dtype=image.dtype)
+        values = values_data[:]
+
+        for i in range(feature_count):
+            try:
+                feature = OGR_L_GetNextFeature(layer)
+                # Assumption: because features are generated by GDAL internally
+                # we assume that they are never NULL.
+
+                geometry = OGR_F_GetGeometryRef(feature)
+
+                if geometry == NULL:
+                    polygons[i] = None
+
+                else:
+                    try:
+                        wkb_size = OGR_G_WkbSize(geometry)
+                        wkb = <char*>malloc(sizeof(char)*wkb_size)
+                        OGR_G_ExportToWkb(geometry, 1, wkb)
+                        polygons[i] = wkb[:wkb_size]
+
+                    finally:
+                        if wkb != NULL:
+                            free(wkb)
+
+                if is_float:
+                    values[i] = OGR_F_GetFieldAsDouble(feature, 0)
+                else:
+                    values[i] = OGR_F_GetFieldAsInteger(feature, 0)
+
+            finally:
+                _deleteOgrFeature(feature)
+
+
+        return (polygon_data, values_data)
 
     finally:
         if fs != NULL:
@@ -380,7 +560,7 @@ def _explode(coords):
 
 
 def _bounds(geometry, north_up=True, transform=None):
-    """Bounding box of a GeoJSON geometry, GeometryCollection, or FeatureCollection.
+    """Bounding box of a GeoJSON geometry.
 
     left, bottom, right, top
     *not* xmin, ymin, xmax, ymax
@@ -390,9 +570,7 @@ def _bounds(geometry, north_up=True, transform=None):
     From Fiona 1.4.8 with updates here to handle feature collections.
     TODO: add to Fiona.
     """
-
     if 'features' in geometry:
-        # Input is a FeatureCollection
         xmins = []
         ymins = []
         xmaxs = []
@@ -408,25 +586,7 @@ def _bounds(geometry, north_up=True, transform=None):
         else:
             return min(xmins), max(ymaxs), max(xmaxs), min(ymins)
 
-    elif 'geometries' in geometry:
-        # Input is a geometry collection
-        xmins = []
-        ymins = []
-        xmaxs = []
-        ymaxs = []
-        for geometry in geometry['geometries']:
-            xmin, ymin, xmax, ymax = _bounds(geometry)
-            xmins.append(xmin)
-            ymins.append(ymin)
-            xmaxs.append(xmax)
-            ymaxs.append(ymax)
-        if north_up:
-            return min(xmins), min(ymins), max(xmaxs), max(ymaxs)
-        else:
-            return min(xmins), max(ymaxs), max(xmaxs), min(ymins)
-
-    elif 'coordinates' in geometry:
-        # Input is a singular geometry object
+    else:
         if transform is not None:
             xyz = list(_explode(geometry['coordinates']))
             xyz_px = [transform * point for point in xyz]
@@ -439,11 +599,6 @@ def _bounds(geometry, north_up=True, transform=None):
             else:
                 return min(xyz[0]), max(xyz[1]), max(xyz[0]), min(xyz[1])
 
-    # all valid inputs returned above, so whatever falls through is an error
-    raise ValueError(
-            "geometry must be a GeoJSON-like geometry, GeometryCollection, "
-            "or FeatureCollection"
-        )
 
 # Mapping of OGR integer geometry types to GeoJSON type names.
 GEOMETRY_TYPES = {

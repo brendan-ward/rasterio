@@ -9,7 +9,7 @@ import os
 import numpy as np
 
 import rasterio
-from rasterio._features import _shapes, _sieve, _rasterize, _bounds
+from rasterio._features import _shapes, _shapes_wkb_array, _sieve, _rasterize, _bounds
 from rasterio.crs import CRS
 from rasterio.dtypes import validate_dtype, can_cast_dtype, get_minimum_dtype
 from rasterio.enums import MergeAlg
@@ -126,6 +126,57 @@ def shapes(source, mask=None, connectivity=4, transform=IDENTITY):
     transform = guard_transform(transform)
     for s, v in _shapes(source, mask, connectivity, transform):
         yield s, v
+
+
+@ensure_env
+def shapes_wkb_array(source, mask=None, connectivity=4, transform=IDENTITY):
+    """
+    Returns a tuple of 1D arrays of WKB-encoded polygons and pixel values.
+
+    Parameters
+    ----------
+    source : array, dataset object, Band, or tuple(dataset, bidx)
+        Data type must be one of rasterio.int16, rasterio.int32,
+        rasterio.uint8, rasterio.uint16, or rasterio.float32.
+    mask : numpy ndarray or rasterio Band object, optional
+        Must evaluate to bool (rasterio.bool_ or rasterio.uint8). Values
+        of False or 0 will be excluded from feature generation.  Note
+        well that this is the inverse sense from Numpy's, where a mask
+        value of True indicates invalid data in an array. If `source` is
+        a Numpy masked array and `mask` is None, the source's mask will
+        be inverted and used in place of `mask`.
+    connectivity : int, optional
+        Use 4 or 8 pixel connectivity for grouping pixels into features
+    transform : Affine transformation, optional
+        If not provided, feature coordinates will be generated based on
+        pixel coordinates
+
+    Returns
+    -------
+    tuple of (polygon array, values array)
+        Values are returned in the dtype of the input image.
+        Note: due to floating point precision issues, values returned from a
+        floating point image may not exactly match the original values.
+
+    Notes
+    -----
+    The amount of memory used by this algorithm is proportional to the
+    number and complexity of polygons produced.  This algorithm is most
+    appropriate for simple thematic data.  Data with high pixel-to-pixel
+    variability, such as imagery, may produce one polygon per pixel and
+    consume large amounts of memory.
+
+    Because the low-level implementation uses either an int32 or float32
+    buffer, uint32 and float64 data cannot be operated on without
+    truncation issues.
+
+    """
+    if hasattr(source, 'mask') and mask is None:
+        mask = ~source.mask
+        source = source.data
+
+    transform = guard_transform(transform)
+    return _shapes_wkb_array(source, mask, connectivity, transform)
 
 
 @ensure_env

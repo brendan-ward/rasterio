@@ -331,6 +331,7 @@ cdef extern from "ogr_api.h" nogil:
                                 OGRGeometryH filter, const char *dialext)
     void OGR_DS_Destroy(OGRDataSourceH datasource)
     OGRSFDriverH OGR_DS_GetDriver(OGRLayerH layer_defn)
+    int OGR_L_GetFeatureCount (void *layer, int forceIfExpensive)
     OGRLayerH OGR_DS_GetLayerByName(OGRDataSourceH datasource,
                                     const char *name)
     int OGR_DS_GetLayerCount(OGRDataSourceH datasource)
